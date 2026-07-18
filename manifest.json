@@ -1,0 +1,62 @@
+{
+  "pluginId": "wisp",
+  "version": "0.1.0",
+  "siloApiVersion": "v1",
+  "supportedPlatforms": [
+    {
+      "os": "linux",
+      "arch": "amd64"
+    },
+    {
+      "os": "linux",
+      "arch": "arm64"
+    }
+  ],
+  "capabilities": [
+    {
+      "type": "request_router.v1",
+      "id": "wisp-requests",
+      "displayName": "Wisp Requests",
+      "description": "Delegates movie and series fulfillment to a Wisp server's HTTP API.",
+      "configSchema": [
+        {
+          "key": "connection",
+          "jsonSchema": "{\"type\":\"object\",\"properties\":{\"wisp_url\":{\"type\":\"string\",\"title\":\"Wisp URL\"},\"wisp_token\":{\"type\":\"string\",\"title\":\"Wisp Token\"}},\"required\":[\"wisp_url\"]}",
+          "adminForm": {
+            "fields": [
+              {
+                "key": "wisp_url",
+                "label": "Wisp URL",
+                "control": "ADMIN_FORM_CONTROL_TEXT",
+                "required": true,
+                "description": "Base URL of the Wisp server. Example: http://wisp:8080",
+                "placeholder": "http://wisp:8080"
+              },
+              {
+                "key": "wisp_token",
+                "label": "Wisp Token",
+                "control": "ADMIN_FORM_CONTROL_PASSWORD",
+                "secret": true,
+                "description": "Optional token. When set it is sent to Wisp as an Authorization: Bearer header. Leave empty if Wisp requires no authentication.",
+                "placeholder": "optional-bearer-token"
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "presentation": {
+    "displayName": "Wisp Request Router",
+    "summary": "Thin Silo request router that delegates all movie and series fulfillment to a Wisp server.",
+    "descriptionMarkdown": "A purpose-built request_router.v1 shim. Every request Silo routes here is handed to a Wisp server over its stable HTTP API (`POST /api/add`); Wisp owns all resolution, quality pinning, and status. The plugin holds no business logic and never blocks: it makes a single fast HTTP call and returns.",
+    "setup_markdown": "Install the plugin, then add a connection under Admin -> Plugins -> Wisp and set the Wisp URL (e.g. http://wisp:8080). Use Test Connection to confirm reachability.",
+    "homepage_url": "https://github.com/dreulavelle/silo-plugin-wisp",
+    "source_url": "https://github.com/dreulavelle/silo-plugin-wisp",
+    "support_url": "https://github.com/dreulavelle/silo-plugin-wisp/issues",
+    "changelog_url": "https://github.com/dreulavelle/silo-plugin-wisp/releases",
+    "publisher_name": "dreulavelle",
+    "publisher_url": "https://github.com/dreulavelle",
+    "license_spdx": "MIT"
+  }
+}

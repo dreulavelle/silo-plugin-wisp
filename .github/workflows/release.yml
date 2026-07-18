@@ -1,0 +1,78 @@
+name: release
+
+# Builds linux/amd64 and linux/arm64 binaries on a version tag, publishes them to
+# a GitHub Release alongside checksums.txt, and updates repository.json in place
+# with the tag's version, download URLs, and per-binary sha256 checksums.
+#
+# This workflow is intentionally self-contained and safe to review before its
+# first real run: it only publishes on a pushed tag matching v*.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify
+        run: |
+          test -z "$(gofmt -l .)" || { echo "gofmt needed"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./...
+
+      - name: Resolve version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build binaries
+        run: make dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum silo-plugin-wisp-* > checksums.txt
+
+      - name: Update repository.json
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          amd64_sum="$(sha256sum dist/silo-plugin-wisp-linux-amd64 | cut -d' ' -f1)"
+          arm64_sum="$(sha256sum dist/silo-plugin-wisp-linux-arm64 | cut -d' ' -f1)"
+          base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${REF_NAME}"
+          jq \
+            --arg version "$VERSION" \
+            --arg checksums_url "${base}/checksums.txt" \
+            --arg amd64_url "${base}/silo-plugin-wisp-linux-amd64" \
+            --arg arm64_url "${base}/silo-plugin-wisp-linux-arm64" \
+            --arg amd64_sum "$amd64_sum" \
+            --arg arm64_sum "$arm64_sum" '
+              .plugins[0].manifest.version = $version
+              | .plugins[0].checksums_url = $checksums_url
+              | .plugins[0].binaries["linux/amd64"] = {url: $amd64_url, checksum: $amd64_sum}
+              | .plugins[0].binaries["linux/arm64"] = {url: $arm64_url, checksum: $arm64_sum}
+            ' repository.json > repository.json.tmp
+          mv repository.json.tmp repository.json
+          cat repository.json
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/silo-plugin-wisp-linux-amd64
+            dist/silo-plugin-wisp-linux-arm64
+            dist/checksums.txt
+            repository.json

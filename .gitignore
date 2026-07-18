@@ -1,0 +1,8 @@
+# Build output
+/dist/
+/silo-plugin-wisp
+*.test
+*.out
+
+# Editor / OS cruft
+.DS_Store
