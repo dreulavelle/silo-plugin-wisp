@@ -68,11 +68,11 @@
       "binaries": {
         "linux/amd64": {
           "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.0/silo-plugin-wisp-linux-amd64",
-          "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+          "checksum": "a9b7d938efe387f591a703f671756a5b041e1e74827fb434b88efb89b82bc7e7"
         },
         "linux/arm64": {
           "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.0/silo-plugin-wisp-linux-arm64",
-          "checksum": "0000000000000000000000000000000000000000000000000000000000000000"
+          "checksum": "def652cdc11611db4a663df64bd12d2a1edd3f05d8d4813c2a0ff9885b10b593"
         }
       }
     }
