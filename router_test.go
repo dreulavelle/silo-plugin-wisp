@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -136,9 +137,9 @@ func TestFulfillMapsDescriptorToAddBody(t *testing.T) {
 }
 
 func TestFulfillIsAnimeFalseIsSent(t *testing.T) {
-	var got wispAddRequest
+	var raw []byte
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		got = decodeAdd(t, r.Body)
+		raw, _ = io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer srv.Close()
@@ -156,7 +157,16 @@ func TestFulfillIsAnimeFalseIsSent(t *testing.T) {
 	if _, err := testRouter().Fulfill(context.Background(), req); err != nil {
 		t.Fatalf("Fulfill error: %v", err)
 	}
-	// is_anime must be present in the JSON (no omitempty), so a false is authoritative.
+	// is_anime must be PRESENT in the wire JSON (no omitempty), so a false is sent
+	// as an authoritative value rather than dropped. Assert on the raw bytes — a
+	// struct decode would default a missing field to false and mask the bug.
+	if !strings.Contains(string(raw), `"is_anime"`) {
+		t.Fatalf("is_anime field absent from wire body: %s", raw)
+	}
+	var got wispAddRequest
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode add body: %v", err)
+	}
 	if got.IsAnime {
 		t.Errorf("is_anime = true, want false")
 	}
@@ -206,6 +216,34 @@ func TestFulfillZeroTargetsOnWisp5xx(t *testing.T) {
 	}
 }
 
+// A non-202 2xx (e.g. 200/204 from a proxy or the wrong wisp path) must be
+// treated as a failure, not a silent success — wisp's add contract is exactly
+// 202 Accepted.
+func TestFulfillRejectsNon202Success(t *testing.T) {
+	for _, code := range []int{http.StatusOK, http.StatusCreated, http.StatusNoContent} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			req := &pluginv1.FulfillRequest{
+				Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+				Qualities:   []*pluginv1.RequestedQuality{{Id: "1080p"}},
+				Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+			}
+			resp, err := testRouter().Fulfill(context.Background(), req)
+			if err != nil {
+				t.Fatalf("Fulfill should not return a gRPC error: %v", err)
+			}
+			if len(resp.GetTargets()) != 0 || resp.GetMessage() == "" {
+				t.Errorf("HTTP %d: want zero targets + message, got %d targets / msg %q",
+					code, len(resp.GetTargets()), resp.GetMessage())
+			}
+		})
+	}
+}
+
 func TestFulfillReturnsFastDespiteLatency(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		time.Sleep(100 * time.Millisecond)
@@ -243,6 +281,59 @@ func TestFulfillNoConnection(t *testing.T) {
 	}
 	if len(resp.GetTargets()) != 0 || resp.GetMessage() == "" {
 		t.Errorf("want zero targets + message, got %+v", resp)
+	}
+}
+
+func TestFulfillRejectsMultipleConnections(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	req := &pluginv1.FulfillRequest{
+		Request:   &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+		Qualities: []*pluginv1.RequestedQuality{{Id: "1080p"}},
+		Connections: []*pluginv1.RouterConnection{
+			connFor("c1", srv.URL, ""),
+			connFor("c2", srv.URL, ""),
+		},
+	}
+	resp, err := testRouter().Fulfill(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Fulfill error: %v", err)
+	}
+	if len(resp.GetTargets()) != 0 || resp.GetMessage() == "" {
+		t.Errorf("want zero targets + message for multiple connections, got %+v", resp)
+	}
+	if called {
+		t.Errorf("Wisp must not be called when multiple connections are configured")
+	}
+}
+
+func TestFulfillEmptyQualities(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	req := &pluginv1.FulfillRequest{
+		Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+		Qualities:   nil,
+		Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+	}
+	resp, err := testRouter().Fulfill(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Fulfill error: %v", err)
+	}
+	if len(resp.GetTargets()) != 0 || resp.GetMessage() == "" {
+		t.Errorf("want zero targets + message for empty qualities, got %+v", resp)
+	}
+	if called {
+		t.Errorf("Wisp must not be called when no qualities are requested")
 	}
 }
 
@@ -464,6 +555,17 @@ func TestValidate(t *testing.T) {
 			t.Errorf("expected wisp_url error for non-http scheme, got %v", resp.GetFieldErrors())
 		}
 	})
+
+	t.Run("url with query or fragment", func(t *testing.T) {
+		for _, bad := range []string{"http://wisp:8080/?x=1", "http://wisp:8080/#frag"} {
+			resp, _ := r.Validate(context.Background(), &pluginv1.ValidateRequest{
+				Connection: connFor("c1", bad, ""),
+			})
+			if resp.GetFieldErrors()["wisp_url"] == "" {
+				t.Errorf("expected wisp_url error for %q (query/fragment), got %v", bad, resp.GetFieldErrors())
+			}
+		}
+	})
 }
 
 func TestListConfigOptionsEmpty(t *testing.T) {
@@ -492,5 +594,26 @@ func TestConnSettingsConfigWins(t *testing.T) {
 	url, token := connSettings(conn)
 	if url != "http://from-config:8080" || token != "cfgtok" {
 		t.Errorf("config values should win: got %q/%q", url, token)
+	}
+}
+
+// An admin who clears wisp_token in the form (present-but-empty) means "no
+// token" — it must NOT resurrect a stale api_key fallback. Precedence is by
+// field presence, not by emptiness.
+func TestConnSettingsEmptyTokenOverridesApiKey(t *testing.T) {
+	conn := &pluginv1.RouterConnection{
+		Id:     "c1",
+		ApiKey: "staletok",
+		Config: &structpb.Struct{Fields: map[string]*structpb.Value{
+			"wisp_url":   structpb.NewStringValue("http://wisp:8080"),
+			"wisp_token": structpb.NewStringValue(""),
+		}},
+	}
+	url, token := connSettings(conn)
+	if url != "http://wisp:8080" {
+		t.Errorf("url = %q, want http://wisp:8080", url)
+	}
+	if token != "" {
+		t.Errorf("token = %q, want empty (present-but-empty config must win over api_key)", token)
 	}
 }

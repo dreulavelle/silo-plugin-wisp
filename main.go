@@ -7,12 +7,7 @@ package main
 
 import (
 	"context"
-	"crypto/sha256"
 	_ "embed"
-	"encoding/hex"
-	"fmt"
-	"os"
-	goruntime "runtime"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
@@ -22,6 +17,12 @@ import (
 
 //go:embed manifest.json
 var manifestJSON []byte
+
+// version is injected at build time via -ldflags "-X main.version=<version>".
+// When empty (e.g. a bare `go build`), the version embedded in manifest.json is
+// used unchanged. LoadWithChecksum only overrides the manifest version when this
+// is non-empty.
+var version string
 
 // runtimeServer serves the plugin manifest. It embeds runtimedefault.Server so
 // the host's Runtime.BindHostBroker is handled for us.
@@ -35,7 +36,11 @@ func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestReques
 }
 
 func main() {
-	manifest, err := loadManifest()
+	// LoadWithChecksum decodes the embedded manifest, overrides its version with
+	// the build-time value (when set), stamps the running binary's sha256
+	// checksum, and validates. The manifest declares its supported platforms
+	// explicitly, so no host-arch fallback is needed.
+	manifest, err := publicmanifest.LoadWithChecksum(manifestJSON, version)
 	if err != nil {
 		panic(err)
 	}
@@ -46,32 +51,4 @@ func main() {
 			RequestRouter: newRouter(),
 		},
 	})
-}
-
-// loadManifest decodes the embedded manifest, stamps the running binary's
-// checksum, and defaults supported platforms to the host arch if the manifest
-// omits them.
-func loadManifest() (*pluginv1.PluginManifest, error) {
-	manifest, err := publicmanifest.Load(manifestJSON)
-	if err != nil {
-		return nil, fmt.Errorf("load embedded manifest: %w", err)
-	}
-
-	executablePath, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("resolve executable path: %w", err)
-	}
-	binaryData, err := os.ReadFile(executablePath)
-	if err != nil {
-		return nil, fmt.Errorf("read executable %q: %w", executablePath, err)
-	}
-	checksum := sha256.Sum256(binaryData)
-	manifest.Checksum = hex.EncodeToString(checksum[:])
-
-	if len(manifest.GetSupportedPlatforms()) == 0 {
-		manifest.SupportedPlatforms = []*pluginv1.SupportedPlatform{
-			{Os: goruntime.GOOS, Arch: goruntime.GOARCH},
-		}
-	}
-	return manifest, nil
 }

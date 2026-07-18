@@ -1,7 +1,8 @@
 BINARY   := silo-plugin-wisp
 VERSION  ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 DIST     := dist
-LDFLAGS  := -s -w
+# Strip symbols and inject the build-time version into main.version.
+LDFLAGS  := -s -w -X main.version=$(VERSION)
 PLATFORMS := linux/amd64 linux/arm64
 
 .PHONY: all build test vet fmt fmt-check tidy clean dist manifest

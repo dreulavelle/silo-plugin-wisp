@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -30,6 +29,12 @@ const (
 // is async (202) and never resolves inline.
 const httpTimeout = 10 * time.Second
 
+// checkStatusBudget is a defensive ceiling on the total work CheckStatus may do,
+// well under Silo's 60s host deadline. In practice CheckStatus makes one HTTP
+// call (per connection, and there is one connection), each already bounded by
+// httpTimeout; this guards against pathological multi-connection input.
+const checkStatusBudget = 30 * time.Second
+
 // router implements the RequestRouter capability by delegating every request to
 // a Wisp server. It holds no per-request state and no credentials; connections
 // (and their wisp_url/wisp_token) are passed in on every call.
@@ -54,6 +59,12 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		return &pluginv1.FulfillResponse{Message: "request descriptor is missing"}, nil
 	}
 
+	// This plugin fronts exactly one Wisp server per installation. Fanning a
+	// single request out to multiple Wisp backends is not a supported topology,
+	// so reject it explicitly rather than silently routing to connections[0].
+	if len(req.GetConnections()) > 1 {
+		return &pluginv1.FulfillResponse{Message: "multiple Wisp connections configured; this plugin supports exactly one — remove the extras"}, nil
+	}
 	conn := firstConnection(req.GetConnections())
 	if conn == nil {
 		return &pluginv1.FulfillResponse{Message: "no Wisp connection configured"}, nil
@@ -69,6 +80,15 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		return &pluginv1.FulfillResponse{Message: "request has no tmdb or imdb id; Wisp cannot track it"}, nil
 	}
 
+	// The host always requests at least one quality (its allowed-quality set
+	// always includes 1080p), so an empty list is a defensive impossible-case.
+	// Handle it without an add: a bare monitor with no quality filter would be
+	// meaningless, and we must never return zero targets without a message.
+	if len(req.GetQualities()) == 0 {
+		return &pluginv1.FulfillResponse{Message: "request specified no qualities; nothing to fulfill"}, nil
+	}
+
+	extID := externalKey(tmdbID, imdbID)
 	body := wispAddRequest{
 		MediaType:  desc.GetMediaType(),
 		TMDbID:     tmdbID,
@@ -78,15 +98,17 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		Year:       int(desc.GetYear()),
 		IsAnime:    desc.GetIsAnime(),
 		Qualities:  toWispQualities(req.GetQualities()),
-		RequestRef: externalKey(tmdbID, imdbID),
+		RequestRef: extID,
 	}
 
-	client := newWispClient(wispURL, token, r.http)
+	client, err := newWispClient(wispURL, token, r.http)
+	if err != nil {
+		return &pluginv1.FulfillResponse{Message: fmt.Sprintf("wisp_url is invalid: %v", err)}, nil
+	}
 	if err := client.add(ctx, body); err != nil {
 		return &pluginv1.FulfillResponse{Message: fmt.Sprintf("Wisp did not accept the request: %v", err)}, nil
 	}
 
-	extID := externalKey(tmdbID, imdbID)
 	const msg = "Wisp accepted the request and is monitoring for a pinnable stream"
 	targets := make([]*pluginv1.FulfillmentTarget, 0, len(req.GetQualities()))
 	for _, q := range req.GetQualities() {
@@ -106,6 +128,12 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 // grouped by connection so Wisp is queried at most once per connection; all
 // targets under the same connection share that title's state.
 func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusRequest) (*pluginv1.CheckStatusResponse, error) {
+	// Bound the whole call so a slow or unresponsive Wisp cannot approach Silo's
+	// deadline. In practice there is one connection and one HTTP call (each with
+	// its own 10s client timeout); this is a defensive total-work ceiling.
+	ctx, cancel := context.WithTimeout(ctx, checkStatusBudget)
+	defer cancel()
+
 	desc := req.GetRequest()
 	var mediaType, tmdbID, imdbID string
 	if desc != nil {
@@ -132,12 +160,17 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 		res, ok := cache[cid]
 		if !ok {
 			wispURL, token := connSettings(connByID[cid])
-			if wispURL == "" {
+			switch {
+			case wispURL == "":
 				res = queryResult{err: fmt.Errorf("wisp_url is not configured for this connection")}
-			} else {
-				client := newWispClient(wispURL, token, r.http)
-				st, tracked, err := client.status(ctx, mediaType, tmdbID, imdbID)
-				res = queryResult{st: st, tracked: tracked, err: err}
+			default:
+				client, err := newWispClient(wispURL, token, r.http)
+				if err != nil {
+					res = queryResult{err: err}
+				} else {
+					st, tracked, err := client.status(ctx, mediaType, tmdbID, imdbID)
+					res = queryResult{st: st, tracked: tracked, err: err}
+				}
 			}
 			cache[cid] = res
 		}
@@ -192,10 +225,10 @@ func (r *router) TestConnection(ctx context.Context, req *pluginv1.TestConnectio
 	if wispURL == "" {
 		return &pluginv1.TestConnectionResponse{Ok: false, Message: "wisp_url is not configured"}, nil
 	}
-	if !isHTTPURL(wispURL) {
-		return &pluginv1.TestConnectionResponse{Ok: false, Message: "wisp_url must be a valid http(s) URL"}, nil
+	client, err := newWispClient(wispURL, token, r.http)
+	if err != nil {
+		return &pluginv1.TestConnectionResponse{Ok: false, Message: fmt.Sprintf("wisp_url must be a valid http(s) URL: %v", err)}, nil
 	}
-	client := newWispClient(wispURL, token, r.http)
 	if err := client.health(ctx); err != nil {
 		return &pluginv1.TestConnectionResponse{Ok: false, Message: fmt.Sprintf("Wisp is unreachable: %v", err)}, nil
 	}
@@ -204,15 +237,18 @@ func (r *router) TestConnection(ctx context.Context, req *pluginv1.TestConnectio
 
 // Validate sanity-checks the connection config without any network access
 // (TestConnection covers reachability). Only wisp_url is validated; wisp_token
-// is optional.
+// is optional. A present-but-empty wisp_url is a required-field error, not a
+// silent fallback (see connSettings).
 func (r *router) Validate(_ context.Context, req *pluginv1.ValidateRequest) (*pluginv1.ValidateResponse, error) {
 	wispURL, _ := connSettings(req.GetConnection())
 	fieldErrors := make(map[string]string)
 	switch {
 	case wispURL == "":
 		fieldErrors["wisp_url"] = "Wisp URL is required"
-	case !isHTTPURL(wispURL):
-		fieldErrors["wisp_url"] = "Wisp URL must be a valid http(s) URL"
+	default:
+		if _, err := parseWispBase(wispURL); err != nil {
+			fieldErrors["wisp_url"] = fmt.Sprintf("Wisp URL must be a valid http(s) URL: %v", err)
+		}
 	}
 	return &pluginv1.ValidateResponse{FieldErrors: fieldErrors}, nil
 }
@@ -226,21 +262,30 @@ func (r *router) ListConfigOptions(_ context.Context, _ *pluginv1.ListConfigOpti
 // connSettings extracts wisp_url and wisp_token from a connection. Admin-form
 // fields arrive in the config Struct keyed by their field key (verified against
 // the reference plugin, which reads custom fields via
-// conn.GetConfig().GetFields()[key]). The standardized base_url/api_key slots are
-// used as a fallback so the plugin still works if a host maps a "base_url"/
-// "api_key" admin field onto the top-level RouterConnection fields.
+// conn.GetConfig().GetFields()[key]).
+//
+// Precedence is presence-based, not emptiness-based: if the config carries a key
+// (even with an empty value) the admin set it explicitly, so it wins over the
+// standardized base_url/api_key slot. The fallback to base_url/api_key applies
+// only when the key is absent — the case where a host maps a "base_url"/"api_key"
+// admin field onto the top-level RouterConnection fields. A present-but-empty
+// wisp_url therefore yields "" (a validation error downstream), never a silent
+// fallback to base_url.
 func connSettings(conn *pluginv1.RouterConnection) (wispURL, token string) {
 	if conn == nil {
 		return "", ""
 	}
-	if fields := conn.GetConfig().GetFields(); fields != nil {
-		wispURL = strings.TrimSpace(fields["wisp_url"].GetStringValue())
-		token = strings.TrimSpace(fields["wisp_token"].GetStringValue())
-	}
-	if wispURL == "" {
+	fields := conn.GetConfig().GetFields()
+
+	if v, ok := fields["wisp_url"]; ok {
+		wispURL = strings.TrimSpace(v.GetStringValue())
+	} else {
 		wispURL = strings.TrimSpace(conn.GetBaseUrl())
 	}
-	if token == "" {
+
+	if v, ok := fields["wisp_token"]; ok {
+		token = strings.TrimSpace(v.GetStringValue())
+	} else {
 		token = strings.TrimSpace(conn.GetApiKey())
 	}
 	return wispURL, token
@@ -276,14 +321,6 @@ func externalKey(tmdbID, imdbID string) string {
 	default:
 		return ""
 	}
-}
-
-func isHTTPURL(raw string) bool {
-	u, err := url.Parse(strings.TrimSpace(raw))
-	if err != nil {
-		return false
-	}
-	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
 }
 
 func containsFold(list []string, target string) bool {

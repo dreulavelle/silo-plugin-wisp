@@ -1,8 +1,10 @@
 name: release
 
 # Builds linux/amd64 and linux/arm64 binaries on a version tag, publishes them to
-# a GitHub Release alongside checksums.txt, and updates repository.json in place
-# with the tag's version, download URLs, and per-binary sha256 checksums.
+# a GitHub Release alongside checksums.txt, updates repository.json with the tag's
+# version + download URLs + per-binary sha256 checksums, and commits that
+# regenerated repository.json back to main so the raw-main URL is always valid
+# (that URL is what you give Silo's plugin-repository setting).
 #
 # This workflow is intentionally self-contained and safe to review before its
 # first real run: it only publishes on a pushed tag matching v*.
@@ -39,7 +41,7 @@ jobs:
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build binaries
-        run: make dist
+        run: make dist VERSION=${{ steps.version.outputs.version }}
 
       - name: Checksums
         working-directory: dist
@@ -67,6 +69,9 @@ jobs:
             ' repository.json > repository.json.tmp
           mv repository.json.tmp repository.json
           cat repository.json
+          # Stash the regenerated file outside the repo so the later branch
+          # switch to main can restore it cleanly.
+          cp repository.json "$RUNNER_TEMP/repository.json"
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
@@ -76,3 +81,24 @@ jobs:
             dist/silo-plugin-wisp-linux-arm64
             dist/checksums.txt
             repository.json
+
+      # Commit the regenerated repository.json back to main so the raw-main URL
+      # (https://raw.githubusercontent.com/<owner>/silo-plugin-wisp/main/repository.json)
+      # always points at the latest release. [skip ci] avoids retriggering CI.
+      - name: Commit repository.json to main
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch origin main
+          git checkout main
+          # Restore the regenerated file stashed before the branch switch.
+          cp "$RUNNER_TEMP/repository.json" repository.json
+          if git diff --quiet -- repository.json; then
+            echo "repository.json unchanged; nothing to commit"
+            exit 0
+          fi
+          git add repository.json
+          git commit -m "chore: sync repository.json for v${VERSION} [skip ci]"
+          git push origin main

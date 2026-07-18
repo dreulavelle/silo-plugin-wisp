@@ -13,19 +13,50 @@ import (
 
 // wispClient is a thin HTTP client for a single Wisp server. It is cheap to
 // construct per call: it holds only configuration, reusing the shared
-// *http.Client (and thus its connection pool and timeout).
+// *http.Client (and thus its connection pool and timeout). The base URL is
+// parsed and validated once at construction so every endpoint is built
+// structurally rather than by string concatenation.
 type wispClient struct {
-	baseURL string
-	token   string
-	http    *http.Client
+	base  *url.URL
+	token string
+	http  *http.Client
 }
 
-func newWispClient(baseURL, token string, httpClient *http.Client) *wispClient {
-	return &wispClient{
-		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		token:   strings.TrimSpace(token),
-		http:    httpClient,
+// newWispClient parses and validates the base URL and returns a ready client.
+// An invalid base URL (bad scheme, missing host, or a stray query/fragment) is
+// an error, so callers surface it instead of silently building a broken request.
+func newWispClient(rawURL, token string, httpClient *http.Client) (*wispClient, error) {
+	base, err := parseWispBase(rawURL)
+	if err != nil {
+		return nil, err
 	}
+	return &wispClient{base: base, token: strings.TrimSpace(token), http: httpClient}, nil
+}
+
+// parseWispBase validates a Wisp base URL: absolute http(s), with a host and no
+// query or fragment. It is the single source of truth for URL validity, shared
+// by the client and by Validate.
+func parseWispBase(raw string) (*url.URL, error) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, fmt.Errorf("URL must use the http or https scheme")
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("URL must include a host")
+	}
+	if u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("URL must not contain a query or fragment")
+	}
+	return u, nil
+}
+
+// endpoint joins path elements onto the base URL structurally. JoinPath returns
+// a copy, so the returned *url.URL is safe to mutate (e.g. to set a query).
+func (c *wispClient) endpoint(elem ...string) *url.URL {
+	return c.base.JoinPath(elem...)
 }
 
 // wispQuality is one requested tier in a request-shaped add. It mirrors Wisp's
@@ -37,8 +68,9 @@ type wispQuality struct {
 }
 
 // wispAddRequest is the request-shaped intake body Wisp's POST /api/add accepts.
-// is_anime is always sent (never omitted): Silo's descriptor is authoritative on
-// anime classification, and a present flag routes Wisp to the correct root.
+// is_anime and qualities are always emitted (no omitempty): Silo's descriptor is
+// authoritative on anime classification, and the caller guarantees a non-empty
+// qualities list, so a present field is always meaningful on the wire.
 type wispAddRequest struct {
 	MediaType  string        `json:"media_type"`
 	TMDbID     string        `json:"tmdb_id,omitempty"`
@@ -47,7 +79,7 @@ type wispAddRequest struct {
 	Title      string        `json:"title,omitempty"`
 	Year       int           `json:"year,omitempty"`
 	IsAnime    bool          `json:"is_anime"`
-	Qualities  []wispQuality `json:"qualities,omitempty"`
+	Qualities  []wispQuality `json:"qualities"`
 	RequestRef string        `json:"request_ref,omitempty"`
 }
 
@@ -59,15 +91,17 @@ type wispStatus struct {
 	RequestRef      string   `json:"request_ref"`
 }
 
-// add submits a request-shaped intake to Wisp. Wisp is async and idempotent: a
-// 2xx means the request was accepted and is now monitored, not that anything is
-// pinned yet. Any non-2xx (or transport failure) is returned as an error.
+// add submits a request-shaped intake to Wisp. Wisp's async intake answers with
+// exactly 202 Accepted; any other status (including a 200/201/204, which signals
+// a proxy or a wrong-path handler rather than the intake endpoint) is an error.
+// A 202 means the request was accepted and is now monitored, not that anything
+// is pinned yet.
 func (c *wispClient) add(ctx context.Context, body wispAddRequest) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("encode add body: %w", err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/add", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("api", "add").String(), bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -80,8 +114,8 @@ func (c *wispClient) add(ctx context.Context, body wispAddRequest) error {
 	}
 	defer drain(resp.Body)
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("wisp add returned HTTP %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusAccepted {
+		return fmt.Errorf("wisp add returned HTTP %d (expected 202 Accepted)", resp.StatusCode)
 	}
 	return nil
 }
@@ -91,10 +125,7 @@ func (c *wispClient) add(ctx context.Context, body wispAddRequest) error {
 // rather than an error. A non-404 non-2xx response, or a transport failure,
 // returns an error.
 func (c *wispClient) status(ctx context.Context, mediaType, tmdbID, imdbID string) (st *wispStatus, tracked bool, err error) {
-	u, err := url.Parse(c.baseURL + "/api/requests/status")
-	if err != nil {
-		return nil, false, err
-	}
+	u := c.endpoint("api", "requests", "status")
 	q := u.Query()
 	if mediaType != "" {
 		q.Set("media_type", mediaType)
@@ -134,7 +165,7 @@ func (c *wispClient) status(ctx context.Context, mediaType, tmdbID, imdbID strin
 
 // health checks GET /api/healthz. A non-2xx or transport failure is an error.
 func (c *wispClient) health(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/api/healthz", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("api", "healthz").String(), nil)
 	if err != nil {
 		return err
 	}

@@ -33,8 +33,13 @@ and Wisp's HTTP API. It replaces the retired aiostreams plugin's "wisp mode".
    ```
    `make manifest` prints the manifest with the binary's checksum stamped in,
    which is what Silo reads on install.
-2. In Silo, go to **Admin → Plugins** and install the binary (or install from a
-   repository that serves this project's `repository.json`).
+2. In Silo, go to **Admin → Plugins** and install the binary, or point Silo's
+   plugin-repository setting at this project's `repository.json`. Use the raw
+   `main` URL, which the release workflow keeps in sync with the latest release:
+   ```
+   https://raw.githubusercontent.com/dreulavelle/silo-plugin-wisp/main/repository.json
+   ```
+   (Each release also attaches a `repository.json` asset pinned to that tag.)
 3. Add a connection for the **Wisp Requests** capability and fill in the
    connection config below.
 4. Click **Test Connection** to confirm Silo can reach Wisp.
@@ -52,6 +57,11 @@ These values arrive on each call inside `RouterConnection.config` (Silo's admin
 form delivers custom fields in the config `Struct`, keyed by field name). As a
 forward-compat fallback the plugin also reads the standardized
 `RouterConnection.base_url` / `api_key` slots if `config` is empty.
+
+**One connection per installation.** This plugin fronts exactly one Wisp server.
+Configure a single connection for the capability. If more than one is present,
+`Fulfill` returns zero targets with an explanatory message rather than fanning a
+request out across backends — remove the extras.
 
 ## Status mapping
 
