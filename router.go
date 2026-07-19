@@ -73,6 +73,7 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 	if wispURL == "" {
 		return &pluginv1.FulfillResponse{Message: "wisp_url is not configured for this connection"}, nil
 	}
+	ensureWSClient(wispURL, token)
 
 	ids := desc.GetExternalIds()
 	tmdbID, imdbID, tvdbID := ids["tmdb"], ids["imdb"], ids["tvdb"]
@@ -164,6 +165,7 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 			case wispURL == "":
 				res = queryResult{err: fmt.Errorf("wisp_url is not configured for this connection")}
 			default:
+				ensureWSClient(wispURL, token)
 				client, err := newWispClient(wispURL, token, r.http)
 				if err != nil {
 					res = queryResult{err: err}

@@ -15,6 +15,10 @@ import (
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
+func init() {
+	isTesting = true
+}
+
 // testRouter returns a router whose HTTP client has a short timeout so a hung
 // stub fails the test rather than the suite.
 func testRouter() *router {
