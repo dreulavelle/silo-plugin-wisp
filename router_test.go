@@ -918,6 +918,34 @@ func TestValidate(t *testing.T) {
 		}
 	})
 
+	// The plugin fronts exactly one Wisp server. Caught at config time, an admin
+	// sees the problem when adding the second connection; caught only in Fulfill,
+	// every request silently fails afterwards.
+	t.Run("sibling connection is a form error", func(t *testing.T) {
+		resp, err := r.Validate(context.Background(), &pluginv1.ValidateRequest{
+			Connection: connFor("c2", "http://wisp:8080", ""),
+			Siblings:   []*pluginv1.RouterConnection{connFor("c1", "http://wisp:8080", "")},
+		})
+		if err != nil {
+			t.Fatalf("Validate error: %v", err)
+		}
+		if resp.GetFormError() == "" {
+			t.Errorf("expected a form error when a sibling Wisp connection exists")
+		}
+		if len(resp.GetFieldErrors()) != 0 {
+			t.Errorf("field errors = %v, want none (the URL itself is valid)", resp.GetFieldErrors())
+		}
+	})
+
+	t.Run("no siblings is not a form error", func(t *testing.T) {
+		resp, _ := r.Validate(context.Background(), &pluginv1.ValidateRequest{
+			Connection: connFor("c1", "http://wisp:8080", ""),
+		})
+		if resp.GetFormError() != "" {
+			t.Errorf("form error = %q, want none for a lone connection", resp.GetFormError())
+		}
+	})
+
 	t.Run("missing url", func(t *testing.T) {
 		resp, _ := r.Validate(context.Background(), &pluginv1.ValidateRequest{
 			Connection: &pluginv1.RouterConnection{Id: "c1"},

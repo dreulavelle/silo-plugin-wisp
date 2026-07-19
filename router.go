@@ -419,7 +419,16 @@ func (r *router) Validate(_ context.Context, req *pluginv1.ValidateRequest) (*pl
 			fieldErrors["wisp_url"] = fmt.Sprintf("Wisp URL must be a valid http(s) URL: %v", err)
 		}
 	}
-	return &pluginv1.ValidateResponse{FieldErrors: fieldErrors}, nil
+
+	// siblings exists so a plugin can enforce cross-connection rules at config
+	// time. Without this the one-connection invariant is enforced only in
+	// Fulfill, where breaking it silently fails every request instead of telling
+	// the admin at the moment they add the second connection.
+	resp := &pluginv1.ValidateResponse{FieldErrors: fieldErrors}
+	if len(req.GetSiblings()) > 0 {
+		resp.FormError = multiConnectionMsg
+	}
+	return resp, nil
 }
 
 // ListConfigOptions returns no dynamic options: the connection form has only
