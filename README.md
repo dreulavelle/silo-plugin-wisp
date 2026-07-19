@@ -24,6 +24,8 @@ and Wisp's HTTP API. It replaces the retired aiostreams plugin's "wisp mode".
 - **Validate** checks that `wisp_url` parses as an `http(s)` URL. No network.
 - **ListConfigOptions** returns nothing — the form has no dynamic dropdowns.
 
+Silo library refreshes are delivered by Wisp through its supported ARR-compatible Autoscan webhook. Configure `WISP_NOTIFY_ARR_WEBHOOK_URL` and `WISP_NOTIFY_MOUNT_PATH` on Wisp; this plugin does not access Silo's database or guess filesystem paths.
+
 ## Install into Silo
 
 1. Build (or download) the plugin binary for your platform. From source:
