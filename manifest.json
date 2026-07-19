@@ -1,6 +1,6 @@
 {
   "pluginId": "wisp",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "siloApiVersion": "v1",
   "supportedPlatforms": [
     {
