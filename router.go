@@ -134,22 +134,41 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 	ctx, cancel := context.WithTimeout(ctx, checkStatusBudget)
 	defer cancel()
 
-	ident := identityFromDescriptor(req.GetRequest())
+	desc := req.GetRequest()
 
 	connByID := make(map[string]*pluginv1.RouterConnection, len(req.GetConnections()))
 	for _, c := range req.GetConnections() {
 		connByID[c.GetId()] = c
 	}
 
-	cache := make(map[string]queryOutcome)
+	// Identity can now vary per target (it may come from the target's own
+	// external_id), so the query cache is keyed on the connection AND the title.
+	// Keying on the connection alone would serve one title's status for another.
+	type cacheKey struct {
+		conn  string
+		ident titleIdentity
+	}
+	cache := make(map[cacheKey]queryOutcome)
 
 	statuses := make([]*pluginv1.TargetStatus, 0, len(req.GetTargets()))
 	for _, t := range req.GetTargets() {
 		cid := t.GetConnectionId()
-		res, ok := cache[cid]
+		ident := identityForTarget(desc, t)
+		if !ident.ok() {
+			// Never issue an identity-free poll: Wisp answers 400, and a bare
+			// query could not identify a title even if it did not.
+			statuses = append(statuses, mapTargetStatus(t, queryOutcome{
+				permanent: true,
+				err:       fmt.Errorf("no tmdb or imdb id for this target; Wisp cannot be queried"),
+			}))
+			continue
+		}
+
+		key := cacheKey{conn: cid, ident: ident}
+		res, ok := cache[key]
 		if !ok {
 			res = r.queryStatus(ctx, connByID[cid], cid, ident)
-			cache[cid] = res
+			cache[key] = res
 		}
 		statuses = append(statuses, mapTargetStatus(t, res))
 	}
@@ -204,16 +223,44 @@ type titleIdentity struct {
 
 func (id titleIdentity) ok() bool { return id.tmdbID != "" || id.imdbID != "" }
 
-func identityFromDescriptor(desc *pluginv1.RequestDescriptor) titleIdentity {
-	if desc == nil {
-		return titleIdentity{}
+// identityForTarget resolves the ids used to poll Wisp for one target.
+//
+// The descriptor is authoritative when it carries ids, but CheckStatusRequest.
+// request is an ordinary optional field — the host is under no obligation to
+// populate it, and a nil or id-less descriptor used to produce a poll with an
+// empty query string. Fulfill stamps every target's external_id with
+// "tmdb:<id>"/"imdb:<id>" precisely so identity can be carried through, so fall
+// back to it. media_type is only a filter hint and is kept from the descriptor
+// whichever source supplies the ids.
+func identityForTarget(desc *pluginv1.RequestDescriptor, t *pluginv1.TargetRef) titleIdentity {
+	var id titleIdentity
+	if desc != nil {
+		ids := desc.GetExternalIds()
+		id = titleIdentity{
+			mediaType: desc.GetMediaType(),
+			tmdbID:    strings.TrimSpace(ids["tmdb"]),
+			imdbID:    strings.TrimSpace(ids["imdb"]),
+		}
 	}
-	ids := desc.GetExternalIds()
-	return titleIdentity{
-		mediaType: desc.GetMediaType(),
-		tmdbID:    ids["tmdb"],
-		imdbID:    ids["imdb"],
+	if id.ok() {
+		return id
 	}
+
+	scheme, value, found := strings.Cut(t.GetExternalId(), ":")
+	if !found {
+		return id
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return id
+	}
+	switch {
+	case strings.EqualFold(strings.TrimSpace(scheme), "tmdb"):
+		id.tmdbID = value
+	case strings.EqualFold(strings.TrimSpace(scheme), "imdb"):
+		id.imdbID = value
+	}
+	return id
 }
 
 // mapTargetStatus applies the state mapping for a single target:

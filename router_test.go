@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -468,6 +469,150 @@ func TestCheckStatusQueriesOncePerConnection(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("wisp queried %d times, want 1 (deduped per connection)", calls)
+	}
+}
+
+// The status query string is the whole point of the call — a poll that reaches
+// the right path with the wrong (or no) identity is silently useless. Assert on
+// the query itself, not just the path.
+func TestCheckStatusSendsIdentityQuery(t *testing.T) {
+	tests := []struct {
+		name       string
+		desc       *pluginv1.RequestDescriptor
+		externalID string
+		want       map[string]string
+	}{
+		{
+			name: "descriptor supplies tmdb",
+			desc: &pluginv1.RequestDescriptor{
+				MediaType:   "movie",
+				ExternalIds: map[string]string{"tmdb": "27205"},
+			},
+			externalID: "tmdb:27205",
+			want:       map[string]string{"tmdb_id": "27205", "media_type": "movie"},
+		},
+		{
+			name: "descriptor supplies imdb",
+			desc: &pluginv1.RequestDescriptor{
+				MediaType:   "series",
+				ExternalIds: map[string]string{"imdb": "tt22248376"},
+			},
+			externalID: "imdb:tt22248376",
+			want:       map[string]string{"imdb_id": "tt22248376", "media_type": "series"},
+		},
+		{
+			// The host is not obliged to populate CheckStatusRequest.request.
+			// Fulfill stamps external_id for exactly this case.
+			name:       "nil descriptor falls back to target external_id",
+			desc:       nil,
+			externalID: "tmdb:209867",
+			want:       map[string]string{"tmdb_id": "209867"},
+		},
+		{
+			name:       "id-less descriptor falls back to target external_id",
+			desc:       &pluginv1.RequestDescriptor{MediaType: "movie"},
+			externalID: "imdb:tt1375666",
+			want:       map[string]string{"imdb_id": "tt1375666", "media_type": "movie"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var got url.Values
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/requests/status" {
+					t.Errorf("unexpected path %s", r.URL.Path)
+				}
+				got = r.URL.Query()
+				_ = json.NewEncoder(w).Encode(wispStatus{State: "queued", Detail: "resolving stream"})
+			}))
+			defer srv.Close()
+
+			resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+				Request:     tc.desc,
+				Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: tc.externalID}},
+				Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+			})
+			if err != nil {
+				t.Fatalf("CheckStatus error: %v", err)
+			}
+			if got == nil {
+				t.Fatalf("Wisp was never queried (status %+v)", resp.GetStatuses())
+			}
+			for k, want := range tc.want {
+				if got.Get(k) != want {
+					t.Errorf("query %s = %q, want %q (full query: %v)", k, got.Get(k), want, got)
+				}
+			}
+			if got.Get("tmdb_id") == "" && got.Get("imdb_id") == "" {
+				t.Errorf("identity-free query issued: %v", got)
+			}
+		})
+	}
+}
+
+// With no identity from either source, the plugin must not issue a bare query —
+// Wisp answers 400, which would previously have been mapped to "queued" forever.
+func TestCheckStatusNoIdentityDoesNotQuery(t *testing.T) {
+	var called bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		_ = json.NewEncoder(w).Encode(wispStatus{State: "queued"})
+	}))
+	defer srv.Close()
+
+	resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+		Request:     nil,
+		Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1"}},
+		Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+	})
+	if err != nil {
+		t.Fatalf("CheckStatus error: %v", err)
+	}
+	if called {
+		t.Errorf("Wisp must not be queried without an identity")
+	}
+	got := resp.GetStatuses()[0]
+	if got.GetStatus() != statusFailed {
+		t.Errorf("status = %q, want failed", got.GetStatus())
+	}
+	if got.GetMessage() == "" {
+		t.Errorf("want a message explaining the missing identity")
+	}
+}
+
+// Identity varies per target once external_id is a source, so the query cache
+// must be keyed on (connection, identity). Keying on connection alone would
+// report one title's status for another — worse than the bug it dedupes.
+func TestCheckStatusDoesNotCacheAcrossTitles(t *testing.T) {
+	// Wisp reports each title as completed with a different pinned tier, so a
+	// cache collision shows up as the wrong tier being marked completed.
+	pinnedFor := map[string]string{"1": "1080p", "2": "2160p"}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tmdb := r.URL.Query().Get("tmdb_id")
+		_ = json.NewEncoder(w).Encode(wispStatus{
+			State:           "completed",
+			PinnedQualities: []string{pinnedFor[tmdb]},
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+		Targets: []*pluginv1.TargetRef{
+			{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"},
+			{Quality: "2160p", ConnectionId: "c1", ExternalId: "tmdb:2"},
+		},
+		Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+	})
+	if err != nil {
+		t.Fatalf("CheckStatus error: %v", err)
+	}
+	for _, s := range resp.GetStatuses() {
+		if s.GetStatus() != statusCompleted {
+			t.Errorf("quality %s status = %q, want completed — a cache keyed only on "+
+				"connection would serve the other title's pinned tier",
+				s.GetQuality(), s.GetStatus())
+		}
 	}
 }
 
