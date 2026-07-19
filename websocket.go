@@ -88,7 +88,7 @@ func runWSClient(ctx context.Context, wispURL, token string) {
 					continue
 				}
 				if msg.Event == "pin_completed" {
-					triggerDBScan(context.Background(), msg.MediaType, msg.VirtualPath)
+					triggerDBScanDebounced(msg.MediaType, msg.VirtualPath)
 				}
 			}
 		}()
@@ -101,6 +101,37 @@ func runWSClient(ctx context.Context, wispURL, token string) {
 			}
 		}
 	}
+}
+
+var (
+	debounceMu     sync.Mutex
+	debounceTimers = make(map[string]*time.Timer)
+)
+
+func triggerDBScanDebounced(mediaType, vpath string) {
+	debounceMu.Lock()
+	defer debounceMu.Unlock()
+
+	parts := strings.Split(vpath, "/")
+	if len(parts) < 2 {
+		return
+	}
+	key := parts[0] + "/" + parts[1]
+	if len(parts) >= 3 && mediaType == "series" {
+		key = parts[0] + "/" + parts[1] + "/" + parts[2]
+	}
+
+	if timer, ok := debounceTimers[key]; ok {
+		timer.Stop()
+	}
+
+	debounceTimers[key] = time.AfterFunc(2*time.Second, func() {
+		debounceMu.Lock()
+		delete(debounceTimers, key)
+		debounceMu.Unlock()
+
+		triggerDBScan(context.Background(), mediaType, vpath)
+	})
 }
 
 func triggerDBScan(ctx context.Context, mediaType, vpath string) {
