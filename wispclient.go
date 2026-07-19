@@ -51,6 +51,11 @@ func parseWispBase(raw string) (*url.URL, error) {
 	if u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("URL must not contain a query or fragment")
 	}
+	// wisp_url is a non-secret admin field that is echoed back in Validate and
+	// TestConnection messages, so it must not be a place to put a password.
+	if u.User != nil {
+		return nil, fmt.Errorf("URL must not contain credentials; use the Wisp Token field instead")
+	}
 	return u, nil
 }
 

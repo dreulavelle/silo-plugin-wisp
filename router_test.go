@@ -837,11 +837,16 @@ func TestLogHostRedacts(t *testing.T) {
 	}{
 		{"http://wisp:8080", "wisp:8080"},
 		{"https://wisp.example.com/base/path", "wisp.example.com"},
+		{"http://user:hunter2@wisp:8080", "invalid"},
 		{"not-a-url", "invalid"},
 	}
 	for _, tc := range tests {
-		if got := logHost(tc.raw); got != tc.want {
+		got := logHost(tc.raw)
+		if got != tc.want {
 			t.Errorf("logHost(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
+		if strings.Contains(got, "hunter2") {
+			t.Errorf("logHost(%q) leaked a password", tc.raw)
 		}
 	}
 }
@@ -928,6 +933,23 @@ func TestValidate(t *testing.T) {
 		})
 		if resp.GetFieldErrors()["wisp_url"] == "" {
 			t.Errorf("expected wisp_url error for non-http scheme, got %v", resp.GetFieldErrors())
+		}
+	})
+
+	// wisp_url is echoed back in Validate/TestConnection messages, so it must not
+	// be usable as a credential store.
+	t.Run("url with credentials", func(t *testing.T) {
+		for _, bad := range []string{"http://user:hunter2@wisp:8080", "http://user@wisp:8080"} {
+			resp, _ := r.Validate(context.Background(), &pluginv1.ValidateRequest{
+				Connection: connFor("c1", bad, ""),
+			})
+			msg := resp.GetFieldErrors()["wisp_url"]
+			if msg == "" {
+				t.Errorf("expected wisp_url error for %q (embedded credentials)", bad)
+			}
+			if strings.Contains(msg, "hunter2") {
+				t.Errorf("validation message echoed the password: %q", msg)
+			}
 		}
 	})
 
