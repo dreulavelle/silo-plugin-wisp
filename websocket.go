@@ -174,9 +174,10 @@ func triggerDBScan(ctx context.Context, mediaType, vpath string) {
 		if err := rows.Scan(&fid, &p); err != nil {
 			continue
 		}
-		folderID = fid
-		matchedPath = p
-		break
+		if strings.Contains(p, "/wisp") || matchedPath == "" {
+			folderID = fid
+			matchedPath = p
+		}
 	}
 
 	if matchedPath == "" {
