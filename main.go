@@ -7,8 +7,10 @@ package main
 
 import (
 	_ "embed"
+	"os"
 
 	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
+	"github.com/hashicorp/go-hclog"
 )
 
 //go:embed manifest.json
@@ -20,6 +22,28 @@ var manifestJSON []byte
 // only overrides the manifest version when it is non-empty.
 var version string
 
+// pluginLogger builds the plugin's log sink. go-plugin captures a plugin's
+// stderr and, when a line parses as hclog JSON, re-emits it into Silo's own log
+// at the line's level — so JSON on stderr is the supported way for a plugin to
+// be heard. ServeManifest does not take a logger (ServeConfig.Logger is
+// go-plugin's own internal sink), which is why this is wired into the router
+// rather than into the serve config.
+//
+// Level is Info by default and overridable with WISP_PLUGIN_LOG_LEVEL, so a
+// quiet plugin can be made loud without a rebuild.
+func pluginLogger() hclog.Logger {
+	level := hclog.LevelFromString(os.Getenv("WISP_PLUGIN_LOG_LEVEL"))
+	if level == hclog.NoLevel {
+		level = hclog.Info
+	}
+	return hclog.New(&hclog.LoggerOptions{
+		Name:       "wisp",
+		Level:      level,
+		Output:     os.Stderr,
+		JSONFormat: true,
+	})
+}
+
 func main() {
 	// ServeManifest is the SDK's canonical bootstrap. It performs the same
 	// LoadWithChecksum(manifestJSON, version) + panic-on-error + Serve that this
@@ -30,6 +54,6 @@ func main() {
 	// enable and treats a non-OK response as activation failure, the capability
 	// would never be scheduled and CheckStatus would never be called.
 	sdkruntime.ServeManifest(manifestJSON, version, sdkruntime.CapabilityServers{
-		RequestRouter: newRouter(),
+		RequestRouter: newRouter(pluginLogger()),
 	})
 }

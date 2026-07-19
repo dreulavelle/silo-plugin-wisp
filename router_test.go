@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -13,13 +14,16 @@ import (
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
+	"github.com/hashicorp/go-hclog"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
 // testRouter returns a router whose HTTP client has a short timeout so a hung
 // stub fails the test rather than the suite.
 func testRouter() *router {
-	return &router{http: &http.Client{Timeout: 5 * time.Second}}
+	r := newRouter(hclog.NewNullLogger())
+	r.http = &http.Client{Timeout: 5 * time.Second}
+	return r
 }
 
 // connFor builds a RouterConnection carrying wisp_url/wisp_token the way Silo's
@@ -770,6 +774,75 @@ func TestCheckStatusMisconfigurationIsDistinguishable(t *testing.T) {
 				t.Errorf("message = %q, want it to contain %q", got.GetMessage(), tc.want)
 			}
 		})
+	}
+}
+
+// The plugin must be audible ("was CheckStatus even called?") without ever
+// putting a credential in the host's log.
+func TestLoggingIsAudibleAndRedacted(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/add" {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(wispStatus{State: "queued", Detail: "resolving stream"})
+	}))
+	defer srv.Close()
+
+	var logs bytes.Buffer
+	r := newRouter(hclog.New(&hclog.LoggerOptions{
+		Level: hclog.Debug, Output: &logs, JSONFormat: true,
+	}))
+
+	const token = "super-secret-token"
+	conns := []*pluginv1.RouterConnection{connFor("c1", srv.URL, token)}
+	desc := &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}}
+
+	if _, err := r.Fulfill(context.Background(), &pluginv1.FulfillRequest{
+		CapabilityId: "wisp-requests",
+		Request:      desc,
+		Qualities:    []*pluginv1.RequestedQuality{{Id: "1080p"}},
+		Connections:  conns,
+	}); err != nil {
+		t.Fatalf("Fulfill error: %v", err)
+	}
+	if _, err := r.CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+		CapabilityId: "wisp-requests",
+		Request:      desc,
+		Targets:      []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"}},
+		Connections:  conns,
+	}); err != nil {
+		t.Fatalf("CheckStatus error: %v", err)
+	}
+
+	out := logs.String()
+	// Audible: both entry points announce themselves with the capability id.
+	for _, want := range []string{"fulfill", "check status", "wisp-requests"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log is missing %q — the plugin must be able to answer \"was I called\"\n%s", want, out)
+		}
+	}
+	// Redacted: never the token.
+	if strings.Contains(out, token) {
+		t.Errorf("wisp_token leaked into the log:\n%s", out)
+	}
+}
+
+// logHost reduces a wisp_url to host:port so a path (or an unparseable string)
+// never reaches the log verbatim.
+func TestLogHostRedacts(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want string
+	}{
+		{"http://wisp:8080", "wisp:8080"},
+		{"https://wisp.example.com/base/path", "wisp.example.com"},
+		{"not-a-url", "invalid"},
+	}
+	for _, tc := range tests {
+		if got := logHost(tc.raw); got != tc.want {
+			t.Errorf("logHost(%q) = %q, want %q", tc.raw, got, tc.want)
+		}
 	}
 }
 
