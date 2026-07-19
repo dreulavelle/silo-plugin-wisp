@@ -471,6 +471,116 @@ func TestCheckStatusQueriesOncePerConnection(t *testing.T) {
 	}
 }
 
+// A permanently broken setup must be visibly broken. Mapping these to "queued"
+// makes them indistinguishable from a healthy in-progress request, and the host
+// then polls a doomed target forever — the live wedge this suite guards against.
+func TestCheckStatusPermanentFailuresAreNotQueued(t *testing.T) {
+	for _, code := range []int{
+		http.StatusBadRequest,
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+	} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+				Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+				Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"}},
+				Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+			})
+			if err != nil {
+				t.Fatalf("CheckStatus error: %v", err)
+			}
+			got := resp.GetStatuses()[0]
+			if got.GetStatus() != statusFailed {
+				t.Errorf("HTTP %d status = %q, want failed", code, got.GetStatus())
+			}
+			if got.GetMessage() == "" {
+				t.Errorf("HTTP %d: want a message explaining the failure", code)
+			}
+		})
+	}
+}
+
+// 5xx and 429 are the conditions a re-poll is meant to ride out — they must stay
+// queued, or a Wisp restart would fail every in-flight request.
+func TestCheckStatusTransientFailuresStayQueued(t *testing.T) {
+	for _, code := range []int{
+		http.StatusInternalServerError,
+		http.StatusBadGateway,
+		http.StatusServiceUnavailable,
+		http.StatusTooManyRequests,
+	} {
+		t.Run(http.StatusText(code), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(code)
+			}))
+			defer srv.Close()
+
+			resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+				Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+				Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"}},
+				Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+			})
+			if err != nil {
+				t.Fatalf("CheckStatus error: %v", err)
+			}
+			if got := resp.GetStatuses()[0].GetStatus(); got != statusQueued {
+				t.Errorf("HTTP %d status = %q, want queued", code, got)
+			}
+		})
+	}
+}
+
+// "no such connection" and "connection present but unconfigured" are different
+// operator problems and must not collapse to the same message.
+func TestCheckStatusMisconfigurationIsDistinguishable(t *testing.T) {
+	tests := []struct {
+		name  string
+		conns []*pluginv1.RouterConnection
+		want  string // substring the message must contain
+	}{
+		{
+			name:  "connection absent from request",
+			conns: nil,
+			want:  `no connection "c1"`,
+		},
+		{
+			name:  "connection present but no wisp_url",
+			conns: []*pluginv1.RouterConnection{{Id: "c1"}},
+			want:  "wisp_url is not configured",
+		},
+		{
+			name:  "connection present but wisp_url invalid",
+			conns: []*pluginv1.RouterConnection{connFor("c1", "not-a-url", "")},
+			want:  "wisp_url is invalid",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+				Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+				Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"}},
+				Connections: tc.conns,
+			})
+			if err != nil {
+				t.Fatalf("CheckStatus error: %v", err)
+			}
+			got := resp.GetStatuses()[0]
+			if got.GetStatus() != statusFailed {
+				t.Errorf("status = %q, want failed (a misconfiguration never clears on its own)", got.GetStatus())
+			}
+			if !strings.Contains(got.GetMessage(), tc.want) {
+				t.Errorf("message = %q, want it to contain %q", got.GetMessage(), tc.want)
+			}
+		})
+	}
+}
+
 func TestTestConnection(t *testing.T) {
 	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/healthz" {

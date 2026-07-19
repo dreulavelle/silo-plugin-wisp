@@ -134,72 +134,124 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 	ctx, cancel := context.WithTimeout(ctx, checkStatusBudget)
 	defer cancel()
 
-	desc := req.GetRequest()
-	var mediaType, tmdbID, imdbID string
-	if desc != nil {
-		mediaType = desc.GetMediaType()
-		ids := desc.GetExternalIds()
-		tmdbID, imdbID = ids["tmdb"], ids["imdb"]
-	}
+	ident := identityFromDescriptor(req.GetRequest())
 
 	connByID := make(map[string]*pluginv1.RouterConnection, len(req.GetConnections()))
 	for _, c := range req.GetConnections() {
 		connByID[c.GetId()] = c
 	}
 
-	type queryResult struct {
-		st      *wispStatus
-		tracked bool
-		err     error
-	}
-	cache := make(map[string]queryResult)
+	cache := make(map[string]queryOutcome)
 
 	statuses := make([]*pluginv1.TargetStatus, 0, len(req.GetTargets()))
 	for _, t := range req.GetTargets() {
 		cid := t.GetConnectionId()
 		res, ok := cache[cid]
 		if !ok {
-			wispURL, token := connSettings(connByID[cid])
-			switch {
-			case wispURL == "":
-				res = queryResult{err: fmt.Errorf("wisp_url is not configured for this connection")}
-			default:
-				client, err := newWispClient(wispURL, token, r.http)
-				if err != nil {
-					res = queryResult{err: err}
-				} else {
-					st, tracked, err := client.status(ctx, mediaType, tmdbID, imdbID)
-					res = queryResult{st: st, tracked: tracked, err: err}
-				}
-			}
+			res = r.queryStatus(ctx, connByID[cid], cid, ident)
 			cache[cid] = res
 		}
-		statuses = append(statuses, mapTargetStatus(t, res.st, res.tracked, res.err))
+		statuses = append(statuses, mapTargetStatus(t, res))
 	}
 	return &pluginv1.CheckStatusResponse{Statuses: statuses}, nil
 }
 
+// queryOutcome is the classified result of one Wisp status query, shared by every
+// target that resolves to the same connection.
+type queryOutcome struct {
+	st      *wispStatus
+	tracked bool
+	err     error
+
+	// permanent marks err as a condition that will not clear on its own: a
+	// misconfiguration, or a rejection Wisp will keep making. Transient errors
+	// leave the target queued so the host re-polls; permanent ones fail it, so a
+	// broken setup is visibly broken instead of being indistinguishable from a
+	// healthy in-progress request and wedging forever.
+	permanent bool
+}
+
+// queryStatus resolves one connection to a Wisp status. conn is nil when a target
+// names a connection the host did not send — a distinct condition from a
+// connection that is present but unconfigured, and reported as such.
+func (r *router) queryStatus(ctx context.Context, conn *pluginv1.RouterConnection, cid string, ident titleIdentity) queryOutcome {
+	if conn == nil {
+		return queryOutcome{permanent: true, err: fmt.Errorf("no connection %q is configured for this plugin", cid)}
+	}
+	wispURL, token := connSettings(conn)
+	if wispURL == "" {
+		return queryOutcome{permanent: true, err: fmt.Errorf("wisp_url is not configured for this connection")}
+	}
+	client, err := newWispClient(wispURL, token, r.http)
+	if err != nil {
+		return queryOutcome{permanent: true, err: fmt.Errorf("wisp_url is invalid: %w", err)}
+	}
+	st, tracked, err := client.status(ctx, ident.mediaType, ident.tmdbID, ident.imdbID)
+	if err != nil {
+		return queryOutcome{permanent: permanentHTTP(err), err: err}
+	}
+	return queryOutcome{st: st, tracked: tracked}
+}
+
+// titleIdentity is the set of ids Wisp's status endpoint accepts. mediaType is an
+// optional filter hint; Wisp requires at least one of tmdbID/imdbID and answers
+// HTTP 400 without one.
+type titleIdentity struct {
+	mediaType string
+	tmdbID    string
+	imdbID    string
+}
+
+func (id titleIdentity) ok() bool { return id.tmdbID != "" || id.imdbID != "" }
+
+func identityFromDescriptor(desc *pluginv1.RequestDescriptor) titleIdentity {
+	if desc == nil {
+		return titleIdentity{}
+	}
+	ids := desc.GetExternalIds()
+	return titleIdentity{
+		mediaType: desc.GetMediaType(),
+		tmdbID:    ids["tmdb"],
+		imdbID:    ids["imdb"],
+	}
+}
+
 // mapTargetStatus applies the state mapping for a single target:
-//   - transport/HTTP error (not 404) -> queued (transient; host re-polls)
-//   - 404 untracked                  -> queued (Wisp will begin tracking)
-//   - Wisp "failed"                  -> failed (Detail as message)
-//   - Wisp "completed"               -> completed if this quality is pinned, else queued
-//   - Wisp "queued"                  -> queued
-func mapTargetStatus(t *pluginv1.TargetRef, st *wispStatus, tracked bool, err error) *pluginv1.TargetStatus {
+//   - permanent error   -> failed (misconfiguration or a 4xx Wisp will repeat)
+//   - transient error   -> queued (transport/5xx/429; host re-polls)
+//   - 404 untracked     -> queued (Wisp will begin tracking)
+//   - Wisp "failed"     -> failed (Detail as message)
+//   - Wisp "completed"  -> completed if this quality is pinned, else queued
+//   - Wisp "queued"     -> queued
+//
+// It is pure: the error paths are logged once per query by CheckStatus rather
+// than here, which would repeat the same line for every target on a connection.
+func mapTargetStatus(t *pluginv1.TargetRef, res queryOutcome) *pluginv1.TargetStatus {
 	out := &pluginv1.TargetStatus{
 		Quality:      t.GetQuality(),
 		ConnectionId: t.GetConnectionId(),
 	}
 	switch {
-	case err != nil:
+	case res.err != nil && res.permanent:
+		out.Status = statusFailed
+		out.ExternalStatus = "error"
+		out.Message = fmt.Sprintf("Wisp cannot be queried: %v", res.err)
+	case res.err != nil:
 		out.Status = statusQueued
 		out.ExternalStatus = "unavailable"
-		out.Message = fmt.Sprintf("Wisp status unavailable: %v", err)
-	case !tracked:
+		out.Message = fmt.Sprintf("Wisp status unavailable: %v", res.err)
+	case !res.tracked:
 		out.Status = statusQueued
 		out.ExternalStatus = "untracked"
 		out.Message = "Wisp is not yet tracking this title"
+	case res.st == nil:
+		// Defensive: no error, tracked, but no body. Unreachable via wispClient;
+		// treated as transient so a future caller cannot wedge a target on it.
+		out.Status = statusQueued
+		out.ExternalStatus = "unavailable"
+		out.Message = "Wisp returned no status for this title"
 	default:
+		st := res.st
 		out.ExternalStatus = st.State
 		out.Message = st.Detail
 		switch st.State {
