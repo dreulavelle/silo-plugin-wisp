@@ -169,8 +169,9 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 }
 
 // CheckStatus maps Wisp's per-title state onto each requested target. Targets are
-// grouped by connection so Wisp is queried at most once per connection; all
-// targets under the same connection share that title's state.
+// grouped by (connection, title identity) so Wisp is queried at most once per
+// distinct title per connection, and every target sharing that pair shares the
+// result.
 func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusRequest) (*pluginv1.CheckStatusResponse, error) {
 	// Bound the whole call so a slow or unresponsive Wisp cannot approach Silo's
 	// deadline. In practice there is one connection and one HTTP call (each with
@@ -233,7 +234,7 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 }
 
 // queryOutcome is the classified result of one Wisp status query, shared by every
-// target that resolves to the same connection.
+// target that resolves to the same connection and title.
 type queryOutcome struct {
 	st      *wispStatus
 	tracked bool
