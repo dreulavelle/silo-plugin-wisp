@@ -157,7 +157,7 @@ func triggerDBScan(ctx context.Context, mediaType, vpath string) {
 	scanID := randULID()
 	_, err = db.ExecContext(ctx, `
 		INSERT INTO scan_runs (id, media_folder_id, mode, path, trigger, status, result_payload, error_message)
-		VALUES ($1, $2, 'subtree', $3, 'plugin', 'pending', '{}', '')`,
+		VALUES ($1, $2, 'subtree', $3, 'plugin', 'accepted', '{}', '')`,
 		scanID, folderID, dirPath)
 	if err != nil {
 		log.Printf("triggerDBScan error: %v", err)
