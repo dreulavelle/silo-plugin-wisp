@@ -3,7 +3,7 @@
     {
       "manifest": {
         "plugin_id": "wisp",
-        "version": "0.1.1",
+        "version": "0.1.2",
         "silo_api_version": "v1",
         "supported_platforms": [
           {
@@ -64,15 +64,15 @@
         }
       },
       "repo_url": "https://github.com/dreulavelle/silo-plugin-wisp",
-      "checksums_url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.1/checksums.txt",
+      "checksums_url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.2/checksums.txt",
       "binaries": {
         "linux/amd64": {
-          "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.1/silo-plugin-wisp-linux-amd64",
-          "checksum": "e083abe98d9f21ae794c499fe4f5fec2624a3935b26ac4aadd58730852f551da"
+          "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.2/silo-plugin-wisp-linux-amd64",
+          "checksum": "1689494ecb0dca736a69e6ad86dfac9999f0c85b1046ae28c751a2fb3cb8da77"
         },
         "linux/arm64": {
-          "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.1/silo-plugin-wisp-linux-arm64",
-          "checksum": "bb3698366b0290e1e699adecfb0b2e2a033c25cda20afaad4f99231b07fec5ad"
+          "url": "https://github.com/dreulavelle/silo-plugin-wisp/releases/download/v0.1.2/silo-plugin-wisp-linux-arm64",
+          "checksum": "a48414813299528b3808fb86c1c27b83c38b489af9b69d13961c116a0b145c3c"
         }
       }
     }
