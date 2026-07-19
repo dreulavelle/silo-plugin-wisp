@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -50,7 +51,39 @@ func parseWispBase(raw string) (*url.URL, error) {
 	if u.Opaque != "" || u.RawQuery != "" || u.Fragment != "" {
 		return nil, fmt.Errorf("URL must not contain a query or fragment")
 	}
+	// wisp_url is a non-secret admin field that is echoed back in Validate and
+	// TestConnection messages, so it must not be a place to put a password.
+	if u.User != nil {
+		return nil, fmt.Errorf("URL must not contain credentials; use the Wisp Token field instead")
+	}
 	return u, nil
+}
+
+// httpStatusError is a non-2xx response from Wisp. It carries the status code so
+// callers can tell a permanent rejection (4xx — bad token, malformed query) from
+// a transient one (5xx, 429), which is the difference between failing a target
+// and leaving it queued for the next poll.
+type httpStatusError struct {
+	op   string
+	Code int
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("wisp %s returned HTTP %d", e.op, e.Code)
+}
+
+// permanentHTTP reports whether err is a Wisp response that will keep recurring
+// until a human changes something: a 4xx other than 404 (handled separately as
+// "not yet tracked") and 429 (rate limited — retry later). Transport failures
+// and decode failures are not permanent: they are exactly the transient
+// conditions a re-poll is meant to ride out.
+func permanentHTTP(err error) bool {
+	var he *httpStatusError
+	if !errors.As(err, &he) {
+		return false
+	}
+	return he.Code >= 400 && he.Code < 500 &&
+		he.Code != http.StatusNotFound && he.Code != http.StatusTooManyRequests
 }
 
 // endpoint joins path elements onto the base URL structurally. JoinPath returns
@@ -154,7 +187,7 @@ func (c *wispClient) status(ctx context.Context, mediaType, tmdbID, imdbID strin
 		return nil, false, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, false, fmt.Errorf("wisp status returned HTTP %d", resp.StatusCode)
+		return nil, false, &httpStatusError{op: "status", Code: resp.StatusCode}
 	}
 	var out wispStatus
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&out); err != nil {

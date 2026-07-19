@@ -8,6 +8,7 @@ import (
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	"github.com/hashicorp/go-hclog"
 )
 
 // Host-normalized status values (see request_router.proto).
@@ -23,6 +24,11 @@ const (
 	wispStateCompleted = "completed"
 	wispStateFailed    = "failed"
 )
+
+// multiConnectionMsg is the single wording for the one-connection invariant,
+// shared by Fulfill (which refuses to route) and Validate (which surfaces it at
+// config time, before any request can silently fail).
+const multiConnectionMsg = "multiple Wisp connections configured; this plugin supports exactly one — remove the extras"
 
 // httpTimeout bounds every call to Wisp. Fulfill makes exactly one HTTP call, so
 // this keeps the plugin far under Silo's 60s fulfillment deadline: Wisp's intake
@@ -41,10 +47,35 @@ const checkStatusBudget = 30 * time.Second
 type router struct {
 	pluginv1.UnimplementedRequestRouterServer
 	http *http.Client
+	log  hclog.Logger
 }
 
-func newRouter() *router {
-	return &router{http: &http.Client{Timeout: httpTimeout}}
+// newRouter builds the capability server. A nil logger is accepted and discarded
+// so callers that do not care about output (tests) need not construct one.
+func newRouter(log hclog.Logger) *router {
+	if log == nil {
+		log = hclog.NewNullLogger()
+	}
+	return &router{http: &http.Client{Timeout: httpTimeout}, log: log}
+}
+
+// fulfillFailed logs and returns a rejection. Silo reads zero targets plus a
+// message as a submission failure; the log line is what makes the reason
+// visible from outside the plugin.
+func (r *router) fulfillFailed(reason string) (*pluginv1.FulfillResponse, error) {
+	r.log.Warn("fulfill rejected", "reason", reason)
+	return &pluginv1.FulfillResponse{Message: reason}, nil
+}
+
+// logHost reduces a wisp_url to its host:port for logging. It never echoes the
+// raw URL: a path or (rejected, but be defensive) userinfo must not reach the
+// log. An unparseable URL logs as "invalid" rather than leaking its text.
+func logHost(rawURL string) string {
+	u, err := parseWispBase(rawURL)
+	if err != nil {
+		return "invalid"
+	}
+	return u.Host
 }
 
 // Fulfill hands the request to Wisp via POST /api/add and returns one target per
@@ -55,29 +86,35 @@ func newRouter() *router {
 // failure and will retry.
 func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pluginv1.FulfillResponse, error) {
 	desc := req.GetRequest()
+	r.log.Info("fulfill",
+		"capability_id", req.GetCapabilityId(),
+		"media_type", desc.GetMediaType(),
+		"qualities", len(req.GetQualities()),
+		"connections", len(req.GetConnections()))
+
 	if desc == nil {
-		return &pluginv1.FulfillResponse{Message: "request descriptor is missing"}, nil
+		return r.fulfillFailed("request descriptor is missing")
 	}
 
 	// This plugin fronts exactly one Wisp server per installation. Fanning a
 	// single request out to multiple Wisp backends is not a supported topology,
 	// so reject it explicitly rather than silently routing to connections[0].
 	if len(req.GetConnections()) > 1 {
-		return &pluginv1.FulfillResponse{Message: "multiple Wisp connections configured; this plugin supports exactly one — remove the extras"}, nil
+		return r.fulfillFailed(multiConnectionMsg)
 	}
 	conn := firstConnection(req.GetConnections())
 	if conn == nil {
-		return &pluginv1.FulfillResponse{Message: "no Wisp connection configured"}, nil
+		return r.fulfillFailed("no Wisp connection configured")
 	}
 	wispURL, token := connSettings(conn)
 	if wispURL == "" {
-		return &pluginv1.FulfillResponse{Message: "wisp_url is not configured for this connection"}, nil
+		return r.fulfillFailed("wisp_url is not configured for this connection")
 	}
 
 	ids := desc.GetExternalIds()
 	tmdbID, imdbID, tvdbID := ids["tmdb"], ids["imdb"], ids["tvdb"]
 	if tmdbID == "" && imdbID == "" {
-		return &pluginv1.FulfillResponse{Message: "request has no tmdb or imdb id; Wisp cannot track it"}, nil
+		return r.fulfillFailed("request has no tmdb or imdb id; Wisp cannot track it")
 	}
 
 	// The host always requests at least one quality (its allowed-quality set
@@ -85,8 +122,13 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 	// Handle it without an add: a bare monitor with no quality filter would be
 	// meaningless, and we must never return zero targets without a message.
 	if len(req.GetQualities()) == 0 {
-		return &pluginv1.FulfillResponse{Message: "request specified no qualities; nothing to fulfill"}, nil
+		return r.fulfillFailed("request specified no qualities; nothing to fulfill")
 	}
+
+	// The host matches a status back to a request by (quality, connection_id), so
+	// two targets sharing a quality are unresolvable. Dedupe once and use the
+	// result for both the Wisp body and the returned targets.
+	quals := dedupeQualities(req.GetQualities())
 
 	extID := externalKey(tmdbID, imdbID)
 	body := wispAddRequest{
@@ -97,21 +139,23 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		Title:      desc.GetTitle(),
 		Year:       int(desc.GetYear()),
 		IsAnime:    desc.GetIsAnime(),
-		Qualities:  toWispQualities(req.GetQualities()),
+		Qualities:  toWispQualities(quals),
 		RequestRef: extID,
 	}
 
 	client, err := newWispClient(wispURL, token, r.http)
 	if err != nil {
-		return &pluginv1.FulfillResponse{Message: fmt.Sprintf("wisp_url is invalid: %v", err)}, nil
+		return r.fulfillFailed(fmt.Sprintf("wisp_url is invalid: %v", err))
 	}
 	if err := client.add(ctx, body); err != nil {
-		return &pluginv1.FulfillResponse{Message: fmt.Sprintf("Wisp did not accept the request: %v", err)}, nil
+		return r.fulfillFailed(fmt.Sprintf("Wisp did not accept the request: %v", err))
 	}
 
+	r.log.Info("wisp accepted request", "wisp_host", logHost(wispURL), "targets", len(quals))
+
 	const msg = "Wisp accepted the request and is monitoring for a pinnable stream"
-	targets := make([]*pluginv1.FulfillmentTarget, 0, len(req.GetQualities()))
-	for _, q := range req.GetQualities() {
+	targets := make([]*pluginv1.FulfillmentTarget, 0, len(quals))
+	for _, q := range quals {
 		targets = append(targets, &pluginv1.FulfillmentTarget{
 			Quality:        q.GetId(),
 			ConnectionId:   conn.GetId(),
@@ -125,8 +169,9 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 }
 
 // CheckStatus maps Wisp's per-title state onto each requested target. Targets are
-// grouped by connection so Wisp is queried at most once per connection; all
-// targets under the same connection share that title's state.
+// grouped by (connection, title identity) so Wisp is queried at most once per
+// distinct title per connection, and every target sharing that pair shares the
+// result.
 func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusRequest) (*pluginv1.CheckStatusResponse, error) {
 	// Bound the whole call so a slow or unresponsive Wisp cannot approach Silo's
 	// deadline. In practice there is one connection and one HTTP call (each with
@@ -135,71 +180,196 @@ func (r *router) CheckStatus(ctx context.Context, req *pluginv1.CheckStatusReque
 	defer cancel()
 
 	desc := req.GetRequest()
-	var mediaType, tmdbID, imdbID string
-	if desc != nil {
-		mediaType = desc.GetMediaType()
-		ids := desc.GetExternalIds()
-		tmdbID, imdbID = ids["tmdb"], ids["imdb"]
-	}
 
 	connByID := make(map[string]*pluginv1.RouterConnection, len(req.GetConnections()))
 	for _, c := range req.GetConnections() {
 		connByID[c.GetId()] = c
 	}
 
-	type queryResult struct {
-		st      *wispStatus
-		tracked bool
-		err     error
+	r.log.Info("check status",
+		"capability_id", req.GetCapabilityId(),
+		"targets", len(req.GetTargets()),
+		"connections", strings.Join(distinctConnectionIDs(req.GetTargets()), ","),
+		"has_descriptor", desc != nil)
+
+	// Identity can now vary per target (it may come from the target's own
+	// external_id), so the query cache is keyed on the connection AND the title.
+	// Keying on the connection alone would serve one title's status for another.
+	type cacheKey struct {
+		conn  string
+		ident titleIdentity
 	}
-	cache := make(map[string]queryResult)
+	cache := make(map[cacheKey]queryOutcome)
 
 	statuses := make([]*pluginv1.TargetStatus, 0, len(req.GetTargets()))
 	for _, t := range req.GetTargets() {
 		cid := t.GetConnectionId()
-		res, ok := cache[cid]
-		if !ok {
-			wispURL, token := connSettings(connByID[cid])
-			switch {
-			case wispURL == "":
-				res = queryResult{err: fmt.Errorf("wisp_url is not configured for this connection")}
-			default:
-				client, err := newWispClient(wispURL, token, r.http)
-				if err != nil {
-					res = queryResult{err: err}
-				} else {
-					st, tracked, err := client.status(ctx, mediaType, tmdbID, imdbID)
-					res = queryResult{st: st, tracked: tracked, err: err}
-				}
-			}
-			cache[cid] = res
+		ident := identityForTarget(desc, t)
+		if !ident.ok() {
+			// Never issue an identity-free poll: Wisp answers 400, and a bare
+			// query could not identify a title even if it did not.
+			r.log.Warn("no identity for target", "quality", t.GetQuality(), "connection_id", cid)
+			statuses = append(statuses, mapTargetStatus(t, queryOutcome{
+				permanent: true,
+				err:       fmt.Errorf("no tmdb or imdb id for this target; Wisp cannot be queried"),
+			}))
+			continue
 		}
-		statuses = append(statuses, mapTargetStatus(t, res.st, res.tracked, res.err))
+
+		key := cacheKey{conn: cid, ident: ident}
+		res, ok := cache[key]
+		if !ok {
+			res = r.queryStatus(ctx, connByID[cid], cid, ident)
+			cache[key] = res
+			if res.err != nil {
+				// Logged here, once per query, rather than in mapTargetStatus,
+				// which would repeat the line for every target on the connection.
+				r.log.Warn("wisp status query failed",
+					"connection_id", cid, "permanent", res.permanent, "err", res.err)
+			}
+		}
+		statuses = append(statuses, mapTargetStatus(t, res))
 	}
 	return &pluginv1.CheckStatusResponse{Statuses: statuses}, nil
 }
 
+// queryOutcome is the classified result of one Wisp status query, shared by every
+// target that resolves to the same connection and title.
+type queryOutcome struct {
+	st      *wispStatus
+	tracked bool
+	err     error
+
+	// permanent marks err as a condition that will not clear on its own: a
+	// misconfiguration, or a rejection Wisp will keep making. Transient errors
+	// leave the target queued so the host re-polls; permanent ones fail it, so a
+	// broken setup is visibly broken instead of being indistinguishable from a
+	// healthy in-progress request and wedging forever.
+	permanent bool
+}
+
+// queryStatus resolves one connection to a Wisp status. conn is nil when a target
+// names a connection the host did not send — a distinct condition from a
+// connection that is present but unconfigured, and reported as such.
+func (r *router) queryStatus(ctx context.Context, conn *pluginv1.RouterConnection, cid string, ident titleIdentity) queryOutcome {
+	if conn == nil {
+		return queryOutcome{permanent: true, err: fmt.Errorf("no connection %q is configured for this plugin", cid)}
+	}
+	wispURL, token := connSettings(conn)
+	if wispURL == "" {
+		return queryOutcome{permanent: true, err: fmt.Errorf("wisp_url is not configured for this connection")}
+	}
+	client, err := newWispClient(wispURL, token, r.http)
+	if err != nil {
+		return queryOutcome{permanent: true, err: fmt.Errorf("wisp_url is invalid: %w", err)}
+	}
+	st, tracked, err := client.status(ctx, ident.mediaType, ident.tmdbID, ident.imdbID)
+	if err != nil {
+		return queryOutcome{permanent: permanentHTTP(err), err: err}
+	}
+	return queryOutcome{st: st, tracked: tracked}
+}
+
+// titleIdentity is the set of ids Wisp's status endpoint accepts. mediaType is an
+// optional filter hint; Wisp requires at least one of tmdbID/imdbID and answers
+// HTTP 400 without one.
+type titleIdentity struct {
+	mediaType string
+	tmdbID    string
+	imdbID    string
+}
+
+// distinctConnectionIDs lists the connections the targets refer to, for logging.
+func distinctConnectionIDs(targets []*pluginv1.TargetRef) []string {
+	seen := make(map[string]bool, len(targets))
+	out := make([]string, 0, len(targets))
+	for _, t := range targets {
+		if id := t.GetConnectionId(); !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+func (id titleIdentity) ok() bool { return id.tmdbID != "" || id.imdbID != "" }
+
+// identityForTarget resolves the ids used to poll Wisp for one target.
+//
+// The descriptor is authoritative when it carries ids, but CheckStatusRequest.
+// request is an ordinary optional field — the host is under no obligation to
+// populate it, and a nil or id-less descriptor used to produce a poll with an
+// empty query string. Fulfill stamps every target's external_id with
+// "tmdb:<id>"/"imdb:<id>" precisely so identity can be carried through, so fall
+// back to it. media_type is only a filter hint and is kept from the descriptor
+// whichever source supplies the ids.
+func identityForTarget(desc *pluginv1.RequestDescriptor, t *pluginv1.TargetRef) titleIdentity {
+	var id titleIdentity
+	if desc != nil {
+		ids := desc.GetExternalIds()
+		id = titleIdentity{
+			mediaType: desc.GetMediaType(),
+			tmdbID:    strings.TrimSpace(ids["tmdb"]),
+			imdbID:    strings.TrimSpace(ids["imdb"]),
+		}
+	}
+	if id.ok() {
+		return id
+	}
+
+	scheme, value, found := strings.Cut(t.GetExternalId(), ":")
+	if !found {
+		return id
+	}
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return id
+	}
+	switch {
+	case strings.EqualFold(strings.TrimSpace(scheme), "tmdb"):
+		id.tmdbID = value
+	case strings.EqualFold(strings.TrimSpace(scheme), "imdb"):
+		id.imdbID = value
+	}
+	return id
+}
+
 // mapTargetStatus applies the state mapping for a single target:
-//   - transport/HTTP error (not 404) -> queued (transient; host re-polls)
-//   - 404 untracked                  -> queued (Wisp will begin tracking)
-//   - Wisp "failed"                  -> failed (Detail as message)
-//   - Wisp "completed"               -> completed if this quality is pinned, else queued
-//   - Wisp "queued"                  -> queued
-func mapTargetStatus(t *pluginv1.TargetRef, st *wispStatus, tracked bool, err error) *pluginv1.TargetStatus {
+//   - permanent error   -> failed (misconfiguration or a 4xx Wisp will repeat)
+//   - transient error   -> queued (transport/5xx/429; host re-polls)
+//   - 404 untracked     -> queued (Wisp will begin tracking)
+//   - Wisp "failed"     -> failed (Detail as message)
+//   - Wisp "completed"  -> completed if this quality is pinned, else queued
+//   - Wisp "queued"     -> queued
+//
+// It is pure: the error paths are logged once per query by CheckStatus rather
+// than here, which would repeat the same line for every target on a connection.
+func mapTargetStatus(t *pluginv1.TargetRef, res queryOutcome) *pluginv1.TargetStatus {
 	out := &pluginv1.TargetStatus{
 		Quality:      t.GetQuality(),
 		ConnectionId: t.GetConnectionId(),
 	}
 	switch {
-	case err != nil:
+	case res.err != nil && res.permanent:
+		out.Status = statusFailed
+		out.ExternalStatus = "error"
+		out.Message = fmt.Sprintf("Wisp cannot be queried: %v", res.err)
+	case res.err != nil:
 		out.Status = statusQueued
 		out.ExternalStatus = "unavailable"
-		out.Message = fmt.Sprintf("Wisp status unavailable: %v", err)
-	case !tracked:
+		out.Message = fmt.Sprintf("Wisp status unavailable: %v", res.err)
+	case !res.tracked:
 		out.Status = statusQueued
 		out.ExternalStatus = "untracked"
 		out.Message = "Wisp is not yet tracking this title"
+	case res.st == nil:
+		// Defensive: no error, tracked, but no body. Unreachable via wispClient;
+		// treated as transient so a future caller cannot wedge a target on it.
+		out.Status = statusQueued
+		out.ExternalStatus = "unavailable"
+		out.Message = "Wisp returned no status for this title"
 	default:
+		st := res.st
 		out.ExternalStatus = st.State
 		out.Message = st.Detail
 		switch st.State {
@@ -209,7 +379,12 @@ func mapTargetStatus(t *pluginv1.TargetRef, st *wispStatus, tracked bool, err er
 			if containsFold(st.PinnedQualities, t.GetQuality()) {
 				out.Status = statusCompleted
 			} else {
+				// Wisp's completed detail describes the title's overall scope
+				// ("requested scope pinned"); passing it through for a tier that
+				// is not in pinned_qualities would claim this quality is done
+				// when it is not. Say which tiers actually landed instead.
 				out.Status = statusQueued
+				out.Message = unpinnedTierMessage(t.GetQuality(), st.PinnedQualities)
 			}
 		default: // wispStateQueued and any unknown state
 			out.Status = statusQueued
@@ -250,7 +425,16 @@ func (r *router) Validate(_ context.Context, req *pluginv1.ValidateRequest) (*pl
 			fieldErrors["wisp_url"] = fmt.Sprintf("Wisp URL must be a valid http(s) URL: %v", err)
 		}
 	}
-	return &pluginv1.ValidateResponse{FieldErrors: fieldErrors}, nil
+
+	// siblings exists so a plugin can enforce cross-connection rules at config
+	// time. Without this the one-connection invariant is enforced only in
+	// Fulfill, where breaking it silently fails every request instead of telling
+	// the admin at the moment they add the second connection.
+	resp := &pluginv1.ValidateResponse{FieldErrors: fieldErrors}
+	if len(req.GetSiblings()) > 0 {
+		resp.FormError = multiConnectionMsg
+	}
+	return resp, nil
 }
 
 // ListConfigOptions returns no dynamic options: the connection form has only
@@ -298,6 +482,24 @@ func firstConnection(conns []*pluginv1.RouterConnection) *pluginv1.RouterConnect
 	return conns[0]
 }
 
+// dedupeQualities drops repeated quality ids, compared case-insensitively,
+// preserving first-seen order. A repeated tier gains Wisp nothing and would
+// produce two FulfillmentTargets identical in quality, connection_id and
+// external_id — which the host cannot tell apart when matching status back.
+func dedupeQualities(quals []*pluginv1.RequestedQuality) []*pluginv1.RequestedQuality {
+	out := make([]*pluginv1.RequestedQuality, 0, len(quals))
+	seen := make(map[string]bool, len(quals))
+	for _, q := range quals {
+		key := strings.ToLower(strings.TrimSpace(q.GetId()))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, q)
+	}
+	return out
+}
+
 func toWispQualities(quals []*pluginv1.RequestedQuality) []wispQuality {
 	if len(quals) == 0 {
 		return nil
@@ -321,6 +523,16 @@ func externalKey(tmdbID, imdbID string) string {
 	default:
 		return ""
 	}
+}
+
+// unpinnedTierMessage explains a target left queued while Wisp reports the title
+// completed. It reports only what Wisp actually sends — state and
+// pinned_qualities — and invents nothing about why the tier is missing.
+func unpinnedTierMessage(quality string, pinned []string) string {
+	if len(pinned) == 0 {
+		return fmt.Sprintf("Wisp has not pinned %s yet", quality)
+	}
+	return fmt.Sprintf("Wisp has not pinned %s yet; pinned so far: %s", quality, strings.Join(pinned, ", "))
 }
 
 func containsFold(list []string, target string) bool {
