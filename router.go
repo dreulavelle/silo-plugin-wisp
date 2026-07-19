@@ -88,6 +88,11 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		return &pluginv1.FulfillResponse{Message: "request specified no qualities; nothing to fulfill"}, nil
 	}
 
+	// The host matches a status back to a request by (quality, connection_id), so
+	// two targets sharing a quality are unresolvable. Dedupe once and use the
+	// result for both the Wisp body and the returned targets.
+	quals := dedupeQualities(req.GetQualities())
+
 	extID := externalKey(tmdbID, imdbID)
 	body := wispAddRequest{
 		MediaType:  desc.GetMediaType(),
@@ -97,7 +102,7 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 		Title:      desc.GetTitle(),
 		Year:       int(desc.GetYear()),
 		IsAnime:    desc.GetIsAnime(),
-		Qualities:  toWispQualities(req.GetQualities()),
+		Qualities:  toWispQualities(quals),
 		RequestRef: extID,
 	}
 
@@ -110,8 +115,8 @@ func (r *router) Fulfill(ctx context.Context, req *pluginv1.FulfillRequest) (*pl
 	}
 
 	const msg = "Wisp accepted the request and is monitoring for a pinnable stream"
-	targets := make([]*pluginv1.FulfillmentTarget, 0, len(req.GetQualities()))
-	for _, q := range req.GetQualities() {
+	targets := make([]*pluginv1.FulfillmentTarget, 0, len(quals))
+	for _, q := range quals {
 		targets = append(targets, &pluginv1.FulfillmentTarget{
 			Quality:        q.GetId(),
 			ConnectionId:   conn.GetId(),
@@ -395,6 +400,24 @@ func firstConnection(conns []*pluginv1.RouterConnection) *pluginv1.RouterConnect
 		return nil
 	}
 	return conns[0]
+}
+
+// dedupeQualities drops repeated quality ids, compared case-insensitively,
+// preserving first-seen order. A repeated tier gains Wisp nothing and would
+// produce two FulfillmentTargets identical in quality, connection_id and
+// external_id — which the host cannot tell apart when matching status back.
+func dedupeQualities(quals []*pluginv1.RequestedQuality) []*pluginv1.RequestedQuality {
+	out := make([]*pluginv1.RequestedQuality, 0, len(quals))
+	seen := make(map[string]bool, len(quals))
+	for _, q := range quals {
+		key := strings.ToLower(strings.TrimSpace(q.GetId()))
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, q)
+	}
+	return out
 }
 
 func toWispQualities(quals []*pluginv1.RequestedQuality) []wispQuality {

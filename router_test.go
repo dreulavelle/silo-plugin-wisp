@@ -338,6 +338,53 @@ func TestFulfillEmptyQualities(t *testing.T) {
 	}
 }
 
+// Duplicate quality ids would produce two FulfillmentTargets identical in
+// quality, connection_id and external_id — the host matches status back by
+// (quality, connection_id), so it could never resolve them.
+func TestFulfillDedupesQualities(t *testing.T) {
+	var got wispAddRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = decodeAdd(t, r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	resp, err := testRouter().Fulfill(context.Background(), &pluginv1.FulfillRequest{
+		Request: &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+		Qualities: []*pluginv1.RequestedQuality{
+			{Id: "1080p"},
+			{Id: "2160p", Is4K: true},
+			{Id: "1080p"},
+			{Id: "1080P"}, // case-folded duplicate
+		},
+		Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+	})
+	if err != nil {
+		t.Fatalf("Fulfill error: %v", err)
+	}
+
+	if len(got.Qualities) != 2 {
+		t.Errorf("wisp qualities = %+v, want 2 deduped", got.Qualities)
+	}
+	// First-seen order is preserved, and the first entry's flags win.
+	if len(got.Qualities) == 2 && (got.Qualities[0].ID != "1080p" || got.Qualities[1].ID != "2160p") {
+		t.Errorf("wisp qualities = %+v, want [1080p 2160p] in first-seen order", got.Qualities)
+	}
+
+	seen := map[string]int{}
+	for _, tgt := range resp.GetTargets() {
+		seen[tgt.GetQuality()]++
+	}
+	if len(resp.GetTargets()) != 2 {
+		t.Errorf("targets = %d, want 2", len(resp.GetTargets()))
+	}
+	for q, n := range seen {
+		if n > 1 {
+			t.Errorf("quality %q emitted %d times; targets must be unique per (quality, connection)", q, n)
+		}
+	}
+}
+
 func TestFulfillNoIdentity(t *testing.T) {
 	req := &pluginv1.FulfillRequest{
 		Request:     &pluginv1.RequestDescriptor{MediaType: "movie"},
