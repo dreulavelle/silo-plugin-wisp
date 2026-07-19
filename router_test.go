@@ -777,6 +777,80 @@ func TestCheckStatusMisconfigurationIsDistinguishable(t *testing.T) {
 	}
 }
 
+// Wisp reports "completed" for the title's overall scope, so a tier that is not
+// in pinned_qualities is still queued — and must not inherit Wisp's
+// "requested scope pinned" detail, which would claim it is done.
+func TestCheckStatusUnpinnedTierMessage(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(wispStatus{
+			State:           "completed",
+			PinnedQualities: []string{"1080p"},
+			Detail:          "requested scope pinned",
+		})
+	}))
+	defer srv.Close()
+
+	resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+		Request: &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+		Targets: []*pluginv1.TargetRef{
+			{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"},
+			{Quality: "2160p", ConnectionId: "c1", ExternalId: "tmdb:1"},
+		},
+		Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+	})
+	if err != nil {
+		t.Fatalf("CheckStatus error: %v", err)
+	}
+
+	byQuality := map[string]*pluginv1.TargetStatus{}
+	for _, s := range resp.GetStatuses() {
+		byQuality[s.GetQuality()] = s
+	}
+
+	if got := byQuality["1080p"]; got.GetMessage() != "requested scope pinned" {
+		t.Errorf("pinned tier message = %q, want Wisp's detail passed through", got.GetMessage())
+	}
+	unpinned := byQuality["2160p"]
+	if unpinned.GetStatus() != statusQueued {
+		t.Errorf("unpinned tier status = %q, want queued", unpinned.GetStatus())
+	}
+	if strings.Contains(unpinned.GetMessage(), "requested scope pinned") {
+		t.Errorf("unpinned tier inherited the completed detail: %q", unpinned.GetMessage())
+	}
+	if !strings.Contains(unpinned.GetMessage(), "2160p") || !strings.Contains(unpinned.GetMessage(), "1080p") {
+		t.Errorf("unpinned tier message = %q, want it to name the tier and what is pinned", unpinned.GetMessage())
+	}
+}
+
+// Wisp's queued detail already distinguishes awaiting-release from resolving, so
+// it is passed through verbatim rather than reworded.
+func TestCheckStatusPassesThroughQueuedDetail(t *testing.T) {
+	for _, detail := range []string{
+		"awaiting home-media release",
+		"awaiting next episode airing",
+		"resolving stream",
+	} {
+		t.Run(detail, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_ = json.NewEncoder(w).Encode(wispStatus{State: "queued", Detail: detail})
+			}))
+			defer srv.Close()
+
+			resp, err := testRouter().CheckStatus(context.Background(), &pluginv1.CheckStatusRequest{
+				Request:     &pluginv1.RequestDescriptor{MediaType: "movie", ExternalIds: map[string]string{"tmdb": "1"}},
+				Targets:     []*pluginv1.TargetRef{{Quality: "1080p", ConnectionId: "c1", ExternalId: "tmdb:1"}},
+				Connections: []*pluginv1.RouterConnection{connFor("c1", srv.URL, "")},
+			})
+			if err != nil {
+				t.Fatalf("CheckStatus error: %v", err)
+			}
+			if got := resp.GetStatuses()[0].GetMessage(); got != detail {
+				t.Errorf("message = %q, want Wisp's detail %q passed through unchanged", got, detail)
+			}
+		})
+	}
+}
+
 // The plugin must be audible ("was CheckStatus even called?") without ever
 // putting a credential in the host's log.
 func TestLoggingIsAudibleAndRedacted(t *testing.T) {

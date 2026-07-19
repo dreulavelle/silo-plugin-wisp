@@ -378,7 +378,12 @@ func mapTargetStatus(t *pluginv1.TargetRef, res queryOutcome) *pluginv1.TargetSt
 			if containsFold(st.PinnedQualities, t.GetQuality()) {
 				out.Status = statusCompleted
 			} else {
+				// Wisp's completed detail describes the title's overall scope
+				// ("requested scope pinned"); passing it through for a tier that
+				// is not in pinned_qualities would claim this quality is done
+				// when it is not. Say which tiers actually landed instead.
 				out.Status = statusQueued
+				out.Message = unpinnedTierMessage(t.GetQuality(), st.PinnedQualities)
 			}
 		default: // wispStateQueued and any unknown state
 			out.Status = statusQueued
@@ -517,6 +522,16 @@ func externalKey(tmdbID, imdbID string) string {
 	default:
 		return ""
 	}
+}
+
+// unpinnedTierMessage explains a target left queued while Wisp reports the title
+// completed. It reports only what Wisp actually sends — state and
+// pinned_qualities — and invents nothing about why the tier is missing.
+func unpinnedTierMessage(quality string, pinned []string) string {
+	if len(pinned) == 0 {
+		return fmt.Sprintf("Wisp has not pinned %s yet", quality)
+	}
+	return fmt.Sprintf("Wisp has not pinned %s yet; pinned so far: %s", quality, strings.Join(pinned, ", "))
 }
 
 func containsFold(list []string, target string) bool {
